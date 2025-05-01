@@ -13,7 +13,7 @@ typedef unsigned char uchar;
 
 #define REFRESH_DELAY 10
 #define MAX_BIRDS 10000
-#define DEFAULT_BIRD_COUNT 1000
+#define DEFAULT_BIRD_COUNT 200
 #define DEFAULT_BENCHMARK_STEPS 1000
 #define DEFAULT_SCALING_STEPS 500
 
@@ -23,7 +23,6 @@ const int NUM_FLOCK_SIZES = sizeof(FLOCK_SIZES) / sizeof(FLOCK_SIZES[0]);
 
 // Performance metrics structure
 struct PerformanceMetrics {
-    float gridUpdateTime;
     float forceCalculationTime;
     float positionUpdateTime;
     int stepsCompleted;
@@ -44,23 +43,22 @@ GLuint displayTex = 0;
 int numBirds = DEFAULT_BIRD_COUNT;
 float minBounds[3] = { -50.0f, -50.0f, -50.0f };
 float maxBounds[3] = { 50.0f, 50.0f, 50.0f };
+
 float separationWeight = 1.0f;
 float alignmentWeight = 1.0f;
-float cohesionWeight = 0.0f;
-int forceThreads = 4;
-int updateThreads = 4;
+float cohesionWeight = 1.0f;
 
 // Function declarations
 void display();
 void initGLBuffers();
 void cleanup();
-void keyboard(unsigned char key, int x, int y);
 void reshape(int x, int y);
 void timerEvent(int value);
 void runVisualization(int argc, char** argv);
 void runBenchmarkMode(int birdCount, int steps);
 void runScalingMode();
 void printUsage();
+void processExitKey(unsigned char key, int x, int y);
 
 // Function declarations for CUDA operations
 extern "C" void initSimulation(int numBirds, float* minBounds, float* maxBounds);
@@ -78,7 +76,7 @@ void initGL(int* argc, char** argv) {
     glutInitWindowSize(width, height);
     glutCreateWindow("Bird Flocking Simulation - CUDA Implementation");
     glutDisplayFunc(display);
-    glutKeyboardFunc(keyboard);
+    glutKeyboardFunc(processExitKey);
     glutReshapeFunc(reshape);
     glutTimerFunc(REFRESH_DELAY, timerEvent, 0);
     glutCloseFunc(cleanup);
@@ -129,7 +127,7 @@ void display() {
     glBindBuffer(GL_PIXEL_UNPACK_BUFFER_ARB, pbo);
     glBindTexture(GL_TEXTURE_RECTANGLE_ARB, displayTex);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-    glTexSubImage2D(GL_TEXTURE_RECTANGLE_ARB, 0, 0, 0, width, height, GL_BGRA, GL_UNSIGNED_BYTE, 0);
+    glTexSubImage2D(GL_TEXTURE_RECTANGLE_ARB, 0, 0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, 0);
     glEnable(GL_TEXTURE_RECTANGLE_ARB);
 
     // Draw textured quad
@@ -160,38 +158,9 @@ void timerEvent(int value) {
     }
 }
 
-// Handle keyboard input
-void keyboard(unsigned char key, int /*x*/, int /*y*/) {
-    switch (key) {
-    case 27:  // ESC key
+void processExitKey(unsigned char key, int /*x*/, int /*y*/) {
+    if (key == 27) {  // ESC key
         glutDestroyWindow(glutGetWindow());
-        return;
-    case '+':
-        separationWeight *= 1.1f;
-        printf("Separation weight: %.2f\n", separationWeight);
-        break;
-    case '-':
-        separationWeight /= 1.1f;
-        printf("Separation weight: %.2f\n", separationWeight);
-        break;
-    case '[':
-        alignmentWeight *= 1.1f;
-        printf("Alignment weight: %.2f\n", alignmentWeight);
-        break;
-    case ']':
-        alignmentWeight /= 1.1f;
-        printf("Alignment weight: %.2f\n", alignmentWeight);
-        break;
-    case ',':
-        cohesionWeight *= 1.1f;
-        printf("Cohesion weight: %.2f\n", cohesionWeight);
-        break;
-    case '.':
-        cohesionWeight /= 1.1f;
-        printf("Cohesion weight: %.2f\n", cohesionWeight);
-        break;
-    default:
-        break;
     }
 }
 
@@ -261,19 +230,16 @@ void printUsage() {
     printf("  BirdSim benchmark <birds>           <birds> birds, %d steps\n", DEFAULT_BENCHMARK_STEPS);
     printf("  BirdSim benchmark <birds> <steps>   <birds> birds, <steps> steps\n");
     printf("  BirdSim scaling                     Run benchmarks across different flock sizes\n");
-    printf("\nThread Control Options:\n");
-    printf("  --threads <num>               Set both thread pools to same value\n");
-    printf("  --force-threads <num>         Set force calculation threads\n");
-    printf("  --update-threads <num>        Set position update threads\n\n");
-    printf("When running the visual simulation, bird colour indicates strongest force:\n");
+    printf("\nWhen running the visual simulation, bird colour indicates strongest force:\n");
     printf("  Red = Separation\n");
-    printf("  Blue = Alignment\n");
-    printf("  Green = Cohesion\n\n");
+    printf("  Green = Alignment\n");
+    printf("  Blue = Cohesion\n\n");
     printf("Visual Controls:\n");
     printf("  ESC - Exit\n");
-    printf("  + / - : Adjust separation weight\n");
-    printf("  [ / ] : Adjust alignment weight\n");
-    printf("  , / . : Adjust cohesion weight\n");
+    printf("Weights (fixed):\n");
+    printf("  Separation: %.1f\n", separationWeight);
+    printf("  Alignment: %.1f\n", alignmentWeight);
+    printf("  Cohesion: %.1f\n", cohesionWeight);
 }
 
 // Run visualization mode
@@ -296,9 +262,10 @@ void runVisualization(int argc, char** argv) {
     // Print controls
     printf("\nControls:\n");
     printf("ESC - Exit\n");
-    printf("+ / - : Increase/decrease separation weight (%.1f)\n", separationWeight);
-    printf("[ / ] : Increase/decrease alignment weight (%.1f)\n", alignmentWeight);
-    printf(", / . : Increase/decrease cohesion weight (%.1f)\n\n", cohesionWeight);
+    printf("\nFixed weights:\n");
+    printf("Separation: %.1f\n", separationWeight);
+    printf("Alignment: %.1f\n", alignmentWeight);
+    printf("Cohesion: %.1f\n\n", cohesionWeight);
 
     // Start rendering loop
     glutMainLoop();
@@ -306,8 +273,8 @@ void runVisualization(int argc, char** argv) {
 
 // Run benchmark mode
 void runBenchmarkMode(int birdCount, int steps) {
-    printf("Running performance benchmark with %d birds for %d steps (force threads: %d, update threads: %d)\n",
-        birdCount, steps, forceThreads, updateThreads);
+    printf("Running performance benchmark with %d birds for %d steps\n",
+        birdCount, steps);
 
     // Initialize simulation
     initSimulation(birdCount, minBounds, maxBounds);
@@ -321,8 +288,7 @@ void runBenchmarkMode(int birdCount, int steps) {
 
 // Run scaling test mode
 void runScalingMode() {
-    printf("Running scaling test with various flock sizes (force threads: %d, update threads: %d)\n",
-        forceThreads, updateThreads);
+    printf("Running scaling test with various flock sizes\n");
 
     runScalingTest((int*)FLOCK_SIZES, NUM_FLOCK_SIZES, DEFAULT_SCALING_STEPS, 0.016f,
         separationWeight, alignmentWeight, cohesionWeight);
@@ -343,23 +309,6 @@ int main(int argc, char** argv) {
     printf("CUDA device [%s] has %d Multi-Processors\n",
         deviceProps.name, deviceProps.multiProcessorCount);
 
-    // Process thread count arguments
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--threads") == 0 && i + 1 < argc) {
-            forceThreads = atoi(argv[i + 1]);
-            updateThreads = forceThreads;
-            i++;
-        }
-        else if (strcmp(argv[i], "--force-threads") == 0 && i + 1 < argc) {
-            forceThreads = atoi(argv[i + 1]);
-            i++;
-        }
-        else if (strcmp(argv[i], "--update-threads") == 0 && i + 1 < argc) {
-            updateThreads = atoi(argv[i + 1]);
-            i++;
-        }
-    }
-
     // Check for mode-specific command line arguments
     if (argc > 1) {
         if (strcmp(argv[1], "benchmark") == 0) {
@@ -370,6 +319,7 @@ int main(int argc, char** argv) {
             if (argc > 2 && argv[2][0] != '-') {
                 birdCount = atoi(argv[2]);
                 if (birdCount <= 0) birdCount = DEFAULT_BIRD_COUNT;
+                if (birdCount > MAX_BIRDS) birdCount = MAX_BIRDS;
 
                 // Parse steps
                 if (argc > 3 && argv[3][0] != '-') {
