@@ -4,6 +4,7 @@
 #include <helper_math.h>
 #include <helper_cuda.h>
 #include <curand_kernel.h>
+#include <time.h>
 
 #define MAX_BIRDS 10000
 #define EPSILON 1e-6f
@@ -14,6 +15,15 @@
 #define CELL_SIZE 30.0f
 
 typedef unsigned char uchar;
+
+// Performance tracking structure
+struct PerformanceMetrics {
+    float gridUpdateTime;
+    float forceCalculationTime;
+    float positionUpdateTime;
+    int stepsCompleted;
+    float totalTime;
+};
 
 // Bird data structure
 struct Bird {
@@ -42,6 +52,15 @@ __device__ __managed__ int numBirds;
 __device__ __managed__ float3 minBounds;
 __device__ __managed__ float3 maxBounds;
 __device__ __managed__ SpatialGrid grid;
+__device__ __managed__ PerformanceMetrics metrics;
+
+// CUDA resources
+curandState* d_states = nullptr;
+int* d_cellIndices = nullptr;
+int* d_particleIndices = nullptr;
+int* d_cellStartIndices = nullptr;
+int* d_cellEndIndices = nullptr;
+cudaEvent_t startEvent, stopEvent, gridStartEvent, gridStopEvent, forceStartEvent, forceStopEvent, posStartEvent, posStopEvent;
 
 // Initialize random number generator
 __global__ void setupRNG(curandState* states) {
@@ -521,7 +540,7 @@ __global__ void renderBirdsKernel(uchar4* output, int width, int height) {
         }
     }
 
-    // If we hit a bird, color it based on its dominant force
+    // If ray intersects with a bird sphere, color it based on its dominant force
     if (closestBird >= 0) {
         uchar4 color;
 
@@ -574,12 +593,60 @@ __global__ void renderBirdsKernel(uchar4* output, int width, int height) {
     }
 }
 
-// CUDA resources
-curandState* d_states = nullptr;
-int* d_cellIndices = nullptr;
-int* d_particleIndices = nullptr;
-int* d_cellStartIndices = nullptr;
-int* d_cellEndIndices = nullptr;
+// Initialize performance metrics
+__global__ void initMetrics() {
+    metrics.gridUpdateTime = 0.0f;
+    metrics.forceCalculationTime = 0.0f;
+    metrics.positionUpdateTime = 0.0f;
+    metrics.stepsCompleted = 0;
+    metrics.totalTime = 0.0f;
+}
+
+// Reset performance metrics
+__global__ void resetMetrics() {
+    metrics.gridUpdateTime = 0.0f;
+    metrics.forceCalculationTime = 0.0f;
+    metrics.positionUpdateTime = 0.0f;
+    metrics.stepsCompleted = 0;
+    metrics.totalTime = 0.0f;
+}
+
+// Free simulation resources - internal implementation
+void freeCudaResources() {
+    if (d_states) {
+        cudaFree(d_states);
+        d_states = nullptr;
+    }
+
+    if (d_cellIndices) {
+        cudaFree(d_cellIndices);
+        d_cellIndices = nullptr;
+    }
+
+    if (d_particleIndices) {
+        cudaFree(d_particleIndices);
+        d_particleIndices = nullptr;
+    }
+
+    if (d_cellStartIndices) {
+        cudaFree(d_cellStartIndices);
+        d_cellStartIndices = nullptr;
+    }
+
+    if (d_cellEndIndices) {
+        cudaFree(d_cellEndIndices);
+        d_cellEndIndices = nullptr;
+    }
+
+    cudaEventDestroy(startEvent);
+    cudaEventDestroy(stopEvent);
+    cudaEventDestroy(gridStartEvent);
+    cudaEventDestroy(gridStopEvent);
+    cudaEventDestroy(forceStartEvent);
+    cudaEventDestroy(forceStopEvent);
+    cudaEventDestroy(posStartEvent);
+    cudaEventDestroy(posStopEvent);
+}
 
 // Initialize the simulation
 extern "C" void initSimulation(int birdCount, float* minBoundsArray, float* maxBoundsArray) {
@@ -622,6 +689,16 @@ extern "C" void initSimulation(int birdCount, float* minBoundsArray, float* maxB
 
     cudaMemcpyToSymbol(grid, &h_grid, sizeof(SpatialGrid));
 
+    // Create CUDA events for timing
+    cudaEventCreate(&startEvent);
+    cudaEventCreate(&stopEvent);
+    cudaEventCreate(&gridStartEvent);
+    cudaEventCreate(&gridStopEvent);
+    cudaEventCreate(&forceStartEvent);
+    cudaEventCreate(&forceStopEvent);
+    cudaEventCreate(&posStartEvent);
+    cudaEventCreate(&posStopEvent);
+
     // Initialize RNG
     cudaMalloc(&d_states, birdCount * sizeof(curandState));
 
@@ -629,6 +706,10 @@ extern "C" void initSimulation(int birdCount, float* minBoundsArray, float* maxB
     dim3 blockSize(256);
     dim3 gridSize((birdCount + blockSize.x - 1) / blockSize.x);
     dim3 cellGridSize((totalCells + blockSize.x - 1) / blockSize.x);
+
+    // Initialize performance metrics
+    initMetrics << <1, 1 >> > ();
+    cudaDeviceSynchronize();
 
     // Initialize grid
     resetGrid << <cellGridSize, blockSize >> > (d_cellStartIndices, d_cellEndIndices, totalCells);
@@ -656,14 +737,120 @@ extern "C" void updateSimulation(float dt, float separationWeight, float alignme
     dim3 gridSize((numBirds + blockSize.x - 1) / blockSize.x);
     dim3 cellGridSize((totalCells + blockSize.x - 1) / blockSize.x);
 
+    float elapsedTime;
+
+    // Start total timing
+    cudaEventRecord(startEvent);
+
     // Update spatial grid
+    cudaEventRecord(gridStartEvent);
     resetGrid << <cellGridSize, blockSize >> > (d_cellStartIndices, d_cellEndIndices, totalCells);
     calculateCellIndices << <gridSize, blockSize >> > (d_particleIndices, d_cellIndices);
     countCellElements << <gridSize, blockSize >> > (d_cellIndices, d_cellStartIndices, d_cellEndIndices);
+    cudaEventRecord(gridStopEvent);
 
-    // Calculate forces and update positions
+    // Calculate forces
+    cudaEventRecord(forceStartEvent);
     calculateForces << <gridSize, blockSize >> > (separationWeight, alignmentWeight, cohesionWeight);
+    cudaEventRecord(forceStopEvent);
+
+    // Update positions
+    cudaEventRecord(posStartEvent);
     updatePositions << <gridSize, blockSize >> > (dt);
+    cudaEventRecord(posStopEvent);
+
+    // End total timing
+    cudaEventRecord(stopEvent);
+    cudaEventSynchronize(stopEvent);
+
+    // Calculate elapsed times
+    cudaEventElapsedTime(&elapsedTime, gridStartEvent, gridStopEvent);
+    PerformanceMetrics h_metrics;
+    cudaMemcpyFromSymbol(&h_metrics, metrics, sizeof(PerformanceMetrics));
+    h_metrics.gridUpdateTime += elapsedTime / 1000.0f;
+
+    cudaEventElapsedTime(&elapsedTime, forceStartEvent, forceStopEvent);
+    h_metrics.forceCalculationTime += elapsedTime / 1000.0f;
+
+    cudaEventElapsedTime(&elapsedTime, posStartEvent, posStopEvent);
+    h_metrics.positionUpdateTime += elapsedTime / 1000.0f;
+
+    cudaEventElapsedTime(&elapsedTime, startEvent, stopEvent);
+    h_metrics.totalTime += elapsedTime / 1000.0f;
+
+    h_metrics.stepsCompleted++;
+
+    cudaMemcpyToSymbol(metrics, &h_metrics, sizeof(PerformanceMetrics));
+}
+
+// Perform benchmark run without visualization
+extern "C" void runBenchmark(int birdCount, int steps, float dt, float separationWeight, float alignmentWeight, float cohesionWeight) {
+    // Reset performance metrics
+    resetMetrics << <1, 1 >> > ();
+    cudaDeviceSynchronize();
+
+    printf("Running benchmark for %d birds with %d steps...\n", birdCount, steps);
+
+    for (int i = 1; i <= steps; i++) {
+        updateSimulation(dt, separationWeight, alignmentWeight, cohesionWeight);
+
+        if (i % 100 == 0 || i == steps) {
+            printf("Completed %d steps (%.1f%%)\n", i, (i * 100.0f) / steps);
+        }
+    }
+
+    // Get final metrics
+    PerformanceMetrics h_metrics;
+    cudaMemcpyFromSymbol(&h_metrics, metrics, sizeof(PerformanceMetrics));
+
+    // Report performance
+    printf("\n=== Performance Report ===\n");
+    printf("Total steps: %d\n", h_metrics.stepsCompleted);
+    printf("Total time: %.3f seconds\n", h_metrics.totalTime);
+    printf("Steps per second: %.1f\n", h_metrics.stepsCompleted / h_metrics.totalTime);
+    printf("Time breakdown:\n");
+    printf("  - Spatial grid updates: %.3fs (%.1f%%)\n",
+        h_metrics.gridUpdateTime,
+        (h_metrics.gridUpdateTime * 100.0f) / h_metrics.totalTime);
+    printf("  - Force calculations: %.3fs (%.1f%%)\n",
+        h_metrics.forceCalculationTime,
+        (h_metrics.forceCalculationTime * 100.0f) / h_metrics.totalTime);
+    printf("  - Position updates: %.3fs (%.1f%%)\n",
+        h_metrics.positionUpdateTime,
+        (h_metrics.positionUpdateTime * 100.0f) / h_metrics.totalTime);
+
+    float overhead = h_metrics.totalTime -
+        (h_metrics.gridUpdateTime +
+            h_metrics.forceCalculationTime +
+            h_metrics.positionUpdateTime);
+
+    printf("  - Other/overhead: %.3fs (%.1f%%)\n",
+        overhead,
+        (overhead * 100.0f) / h_metrics.totalTime);
+    printf("=========================\n");
+}
+
+// Perform scaling test with different flock sizes
+extern "C" void runScalingTest(int* flockSizes, int numSizes, int steps, float dt, float separationWeight, float alignmentWeight, float cohesionWeight) {
+    printf("Running scaling test with various flock sizes...\n");
+
+    for (int s = 0; s < numSizes; s++) {
+        int birdCount = flockSizes[s];
+        printf("\n=== Testing with %d birds ===\n", birdCount);
+
+        // Reinitialize simulation with new bird count
+        float minBoundsArray[3] = { -50.0f, -50.0f, -50.0f };
+        float maxBoundsArray[3] = { 50.0f, 50.0f, 50.0f };
+
+        // Free previous resources
+        freeCudaResources();
+
+        // Initialize with new count
+        initSimulation(birdCount, minBoundsArray, maxBoundsArray);
+
+        // Run benchmark
+        runBenchmark(birdCount, steps, dt, separationWeight, alignmentWeight, cohesionWeight);
+    }
 }
 
 // Render the birds to the output buffer
@@ -675,30 +862,12 @@ extern "C" void renderBirds(int width, int height, uchar4* output) {
     renderBirdsKernel << <gridSize, blockSize >> > (output, width, height);
 }
 
-// Free simulation resources
+// Get performance metrics
+extern "C" void getPerformanceMetrics(PerformanceMetrics* out_metrics) {
+    cudaMemcpyFromSymbol(out_metrics, metrics, sizeof(PerformanceMetrics));
+}
+
+// Free simulation resources - exported function
 extern "C" void freeSimulation() {
-    if (d_states) {
-        cudaFree(d_states);
-        d_states = nullptr;
-    }
-
-    if (d_cellIndices) {
-        cudaFree(d_cellIndices);
-        d_cellIndices = nullptr;
-    }
-
-    if (d_particleIndices) {
-        cudaFree(d_particleIndices);
-        d_particleIndices = nullptr;
-    }
-
-    if (d_cellStartIndices) {
-        cudaFree(d_cellStartIndices);
-        d_cellStartIndices = nullptr;
-    }
-
-    if (d_cellEndIndices) {
-        cudaFree(d_cellEndIndices);
-        d_cellEndIndices = nullptr;
-    }
+    freeCudaResources();
 }
