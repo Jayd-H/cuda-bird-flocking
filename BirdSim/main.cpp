@@ -2,8 +2,6 @@
 #include <GL/freeglut.h>
 #include <stdlib.h>
 #include <stdio.h>
-#include <string.h>
-#include <math.h>
 #include <cuda_runtime.h>
 #include <cuda_gl_interop.h>
 #include <helper_functions.h>
@@ -12,16 +10,16 @@
 typedef unsigned int uint;
 typedef unsigned char uchar;
 
-#define REFRESH_DELAY 10  // ms
+#define REFRESH_DELAY 10
 #define MAX_BIRDS 10000
 
 StopWatchInterface* timer = 0;
 uint width = 1024, height = 768;
-dim3 blockSize(256);  // Each block handles 256 birds
-dim3 gridSize((MAX_BIRDS + blockSize.x - 1) / blockSize.x);  // Calculate grid size based on bird count
+dim3 blockSize(256);
+dim3 gridSize((MAX_BIRDS + blockSize.x - 1) / blockSize.x);
 
-GLuint pbo = 0;  // OpenGL pixel buffer object
-struct cudaGraphicsResource* cuda_pbo_resource;  // handles OpenGL-CUDA exchange
+GLuint pbo = 0;
+struct cudaGraphicsResource* cuda_pbo_resource;
 GLuint displayTex = 0;
 
 // Simulation parameters
@@ -83,7 +81,7 @@ void display() {
     sdkStartTimer(&timer);
 
     // Update bird positions and velocities
-    updateSimulation(0.016f, separationWeight, alignmentWeight, cohesionWeight);  // ~60fps
+    updateSimulation(0.016f, separationWeight, alignmentWeight, cohesionWeight);
 
     // Map PBO to get CUDA device pointer
     uchar4* d_output;
@@ -123,12 +121,10 @@ void display() {
     glBindBuffer(GL_PIXEL_UNPACK_BUFFER_ARB, 0);
 
     glutSwapBuffers();
-    glutReportErrors();
-
     sdkStopTimer(&timer);
 }
 
-// GLUT callback functions
+// GLUT timer callback
 void timerEvent(int value) {
     if (glutGetWindow()) {
         glutPostRedisplay();
@@ -136,6 +132,7 @@ void timerEvent(int value) {
     }
 }
 
+// Handle keyboard input
 void keyboard(unsigned char key, int /*x*/, int /*y*/) {
     switch (key) {
     case 27:  // ESC key
@@ -170,6 +167,7 @@ void keyboard(unsigned char key, int /*x*/, int /*y*/) {
     }
 }
 
+// Handle window resize
 void reshape(int x, int y) {
     width = x;
     height = y;
@@ -182,6 +180,7 @@ void reshape(int x, int y) {
     glOrtho(0.0, 1.0, 0.0, 1.0, 0.0, 1.0);
 }
 
+// Clean up resources
 void cleanup() {
     freeSimulation();
     checkCudaErrors(cudaGraphicsUnregisterResource(cuda_pbo_resource));
@@ -190,13 +189,13 @@ void cleanup() {
     sdkDeleteTimer(&timer);
 }
 
+// Initialize OpenGL buffers
 void initGLBuffers() {
     if (pbo) {
         checkCudaErrors(cudaGraphicsUnregisterResource(cuda_pbo_resource));
         glDeleteBuffers(1, &pbo);
     }
 
-    // Create pixel buffer object for display
     glGenBuffers(1, &pbo);
     glBindBuffer(GL_PIXEL_UNPACK_BUFFER_ARB, pbo);
     glBufferData(GL_PIXEL_UNPACK_BUFFER_ARB, width * height * sizeof(uchar4), 0, GL_STREAM_DRAW_ARB);
@@ -204,7 +203,6 @@ void initGLBuffers() {
 
     checkCudaErrors(cudaGraphicsGLRegisterBuffer(&cuda_pbo_resource, pbo, cudaGraphicsMapFlagsWriteDiscard));
 
-    // Create texture for display
     if (displayTex) {
         glDeleteTextures(1, &displayTex);
     }
@@ -217,41 +215,34 @@ void initGLBuffers() {
     glBindTexture(GL_TEXTURE_RECTANGLE_ARB, 0);
 }
 
+// Program entry point
 int main(int argc, char** argv) {
-    // Set the CUDA device
     int devID = findCudaDevice(argc, (const char**)argv);
     if (devID < 0) {
         printf("No CUDA Capable devices found, exiting...\n");
         exit(EXIT_FAILURE);
     }
 
-    // Print the device info
     cudaDeviceProp deviceProps;
     checkCudaErrors(cudaGetDeviceProperties(&deviceProps, devID));
     printf("CUDA device [%s] has %d Multi-Processors\n",
         deviceProps.name, deviceProps.multiProcessorCount);
 
-    // Initialize GL
     initGL(&argc, argv);
 
-    // Create the timer
     sdkCreateTimer(&timer);
     sdkStartTimer(&timer);
 
-    // Initialize bird simulation
     initSimulation(numBirds, minBounds, maxBounds);
 
-    // Initialize OpenGL buffers
     initGLBuffers();
 
-    // Print controls
     printf("\nControls:\n");
     printf("ESC - Exit\n");
-    printf("+ / - : Increase/decrease separation weight\n");
-    printf("[ / ] : Increase/decrease alignment weight\n");
-    printf(", / . : Increase/decrease cohesion weight\n\n");
+    printf("+ / - : Increase/decrease separation weight (%.1f)\n", separationWeight);
+    printf("[ / ] : Increase/decrease alignment weight (%.1f)\n", alignmentWeight);
+    printf(", / . : Increase/decrease cohesion weight (%.1f)\n\n", cohesionWeight);
 
-    // Start rendering loop
     glutMainLoop();
 
     return 0;
