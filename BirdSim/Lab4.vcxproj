@@ -26,6 +26,7 @@
   <PropertyGroup Label="Globals">
     <ProjectGuid>{D2FE5149-3302-87E4-D888-BD7AE9DEB4AE}</ProjectGuid>
     <RootNamespace>Lab4</RootNamespace>
+    <ProjectName>BirdSim</ProjectName>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">

@@ -44,9 +44,9 @@ GLuint displayTex = 0;
 int numBirds = DEFAULT_BIRD_COUNT;
 float minBounds[3] = { -50.0f, -50.0f, -50.0f };
 float maxBounds[3] = { 50.0f, 50.0f, 50.0f };
-float separationWeight = 3.0f;
+float separationWeight = 1.0f;
 float alignmentWeight = 1.0f;
-float cohesionWeight = 0.5f;
+float cohesionWeight = 0.0f;
 int forceThreads = 4;
 int updateThreads = 4;
 
