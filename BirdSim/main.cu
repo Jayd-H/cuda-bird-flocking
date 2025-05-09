@@ -450,11 +450,11 @@ __global__ void renderBirdsKernel(uchar4* output, int width, int height) {
         case 0: // Separation = Red
             color = make_uchar4(230, 50, 50, 255);
             break;
-        case 1: // Alignment = Green
-            color = make_uchar4(50, 230, 50, 255);
-            break;
-        case 2: // Cohesion = Blue
+        case 1: // Alignment = Blue
             color = make_uchar4(50, 50, 230, 255);
+            break;
+        case 2: // Cohesion = Green
+            color = make_uchar4(50, 230, 50, 255);
             break;
         default:
             color = make_uchar4(200, 200, 200, 255);
