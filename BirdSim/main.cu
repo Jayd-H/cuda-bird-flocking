@@ -1,4 +1,3 @@
-// BirdSim/main.cu
 #include <stdlib.h>
 #include <stdio.h>
 #include <math.h>
