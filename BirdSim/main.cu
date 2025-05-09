@@ -26,21 +26,18 @@ struct Bird {
     float3 position;
     float3 velocity;
     float3 acceleration;
-    int dominantForce; // 0 = separation, 1 = alignment, 2 = cohesion
+    int dominantForce;
 };
 
-// Global variables for the simulation
 __device__ __managed__ Bird birds[MAX_BIRDS];
 __device__ __managed__ int numBirds;
 __device__ __managed__ float3 minBounds;
 __device__ __managed__ float3 maxBounds;
 __device__ __managed__ PerformanceMetrics metrics;
 
-// CUDA resources
 curandState* d_states = nullptr;
 cudaEvent_t startEvent, stopEvent, forceStartEvent, forceStopEvent, posStartEvent, posStopEvent;
 
-// Initialize random number generator
 __global__ void setupRNG(curandState* states) {
     int tid = threadIdx.x + blockIdx.x * blockDim.x;
     if (tid < numBirds) {
@@ -48,24 +45,20 @@ __global__ void setupRNG(curandState* states) {
     }
 }
 
-// Initialize birds with random positions and velocities
 __global__ void initBirds(curandState* states) {
     int tid = threadIdx.x + blockIdx.x * blockDim.x;
     if (tid < numBirds) {
         curandState localState = states[tid];
 
-        // Random position within bounds
         birds[tid].position.x = minBounds.x + curand_uniform(&localState) * (maxBounds.x - minBounds.x);
         birds[tid].position.y = minBounds.y + curand_uniform(&localState) * (maxBounds.y - minBounds.y);
         birds[tid].position.z = minBounds.z + curand_uniform(&localState) * (maxBounds.z - minBounds.z);
 
-        // Random velocity (-1 to 1)
         float3 vel;
         vel.x = curand_uniform(&localState) * 2.0f - 1.0f;
         vel.y = curand_uniform(&localState) * 2.0f - 1.0f;
         vel.z = curand_uniform(&localState) * 2.0f - 1.0f;
 
-        // Normalize velocity and scale
         float len = sqrtf(vel.x * vel.x + vel.y * vel.y + vel.z * vel.z);
         if (len > EPSILON) {
             vel.x /= len;
@@ -73,18 +66,15 @@ __global__ void initBirds(curandState* states) {
             vel.z /= len;
         }
 
-        // Scale velocity and set initial acceleration to zero
-        float speed = 0.5f + curand_uniform(&localState) * 1.5f; // Between 0.5 and 2.0
+        float speed = 0.5f + curand_uniform(&localState) * 1.5f;
         birds[tid].velocity = make_float3(vel.x * speed, vel.y * speed, vel.z * speed);
         birds[tid].acceleration = make_float3(0.0f, 0.0f, 0.0f);
         birds[tid].dominantForce = 0;
 
-        // Save state back for next call
         states[tid] = localState;
     }
 }
 
-// Calculate the wrapped distance between two positions
 __device__ float3 calculateWrappedDistance(float3 pos1, float3 pos2) {
     float3 diff = make_float3(pos1.x - pos2.x, pos1.y - pos2.y, pos1.z - pos2.z);
 
@@ -92,7 +82,6 @@ __device__ float3 calculateWrappedDistance(float3 pos1, float3 pos2) {
     float size_y = maxBounds.y - minBounds.y;
     float size_z = maxBounds.z - minBounds.z;
 
-    // Handle wraparound (toroidal space)
     if (abs(diff.x) > size_x * 0.5f) {
         diff.x = diff.x - copysignf(size_x, diff.x);
     }
@@ -106,8 +95,9 @@ __device__ float3 calculateWrappedDistance(float3 pos1, float3 pos2) {
     return diff;
 }
 
-// Calculate flocking forces for each bird
 __global__ void calculateForces(float separationWeight, float alignmentWeight, float cohesionWeight) {
+    extern __shared__ Bird sharedBirds[];
+
     int tid = threadIdx.x + blockIdx.x * blockDim.x;
     if (tid < numBirds) {
         Bird& bird = birds[tid];
@@ -119,52 +109,65 @@ __global__ void calculateForces(float separationWeight, float alignmentWeight, f
         int alignmentCount = 0;
         int cohesionCount = 0;
 
-        // Check against all other birds
-        for (int i = 0; i < numBirds; i++) {
-            if (i == tid) continue;
-
-            Bird& other = birds[i];
-            float3 diff = calculateWrappedDistance(bird.position, other.position);
-            float dist_sq = diff.x * diff.x + diff.y * diff.y + diff.z * diff.z;
-
-            // Separation (avoid crowding neighbors)
-            if (dist_sq > EPSILON && dist_sq < (PERCEPTION_RADIUS * SEPARATION_RADIUS_FACTOR) * (PERCEPTION_RADIUS * SEPARATION_RADIUS_FACTOR)) {
-                // Calculate separation vector - points away from neighbor
-                float3 repulse = make_float3(diff.x / dist_sq, diff.y / dist_sq, diff.z / dist_sq);
-                separation.x += repulse.x;
-                separation.y += repulse.y;
-                separation.z += repulse.z;
-                separationCount++;
+        for (int chunkStart = 0; chunkStart < numBirds; chunkStart += blockDim.x) {
+            int chunkIdx = chunkStart + threadIdx.x;
+            if (chunkIdx < numBirds) {
+                sharedBirds[threadIdx.x] = birds[chunkIdx];
             }
 
-            // For both alignment and cohesion we use the full perception radius
-            if (dist_sq < PERCEPTION_RADIUS * PERCEPTION_RADIUS) {
-                // Alignment (steer towards average heading of neighbors)
-                alignment.x += other.velocity.x;
-                alignment.y += other.velocity.y;
-                alignment.z += other.velocity.z;
-                alignmentCount++;
+            __syncthreads();
 
-                // Cohesion (move toward average position of neighbors)
-                // Calculate wrapped position of the other bird
-                float3 otherPos = make_float3(
-                    bird.position.x - diff.x,
-                    bird.position.y - diff.y,
-                    bird.position.z - diff.z
-                );
-                cohesion.x += otherPos.x;
-                cohesion.y += otherPos.y;
-                cohesion.z += otherPos.z;
-                cohesionCount++;
+            int chunkSize = min(blockDim.x, numBirds - chunkStart);
+            for (int j = 0; j < chunkSize; j++) {
+                int otherIdx = chunkStart + j;
+                if (tid == otherIdx) continue;
+
+                Bird& other = sharedBirds[j];
+
+                // Early rejection check - just compare one axis first
+                float dx = abs(bird.position.x - other.position.x);
+                float size_x = maxBounds.x - minBounds.x;
+                if (dx > size_x * 0.5f) {
+                    dx = size_x - dx;
+                }
+                if (dx > PERCEPTION_RADIUS) continue;
+
+                float3 diff = calculateWrappedDistance(bird.position, other.position);
+                float dist_sq = diff.x * diff.x + diff.y * diff.y + diff.z * diff.z;
+
+                if (dist_sq > EPSILON && dist_sq < (PERCEPTION_RADIUS * SEPARATION_RADIUS_FACTOR) * (PERCEPTION_RADIUS * SEPARATION_RADIUS_FACTOR)) {
+                    float3 repulse = make_float3(diff.x / dist_sq, diff.y / dist_sq, diff.z / dist_sq);
+                    separation.x += repulse.x;
+                    separation.y += repulse.y;
+                    separation.z += repulse.z;
+                    separationCount++;
+                }
+
+                if (dist_sq < PERCEPTION_RADIUS * PERCEPTION_RADIUS) {
+                    alignment.x += other.velocity.x;
+                    alignment.y += other.velocity.y;
+                    alignment.z += other.velocity.z;
+                    alignmentCount++;
+
+                    float3 otherPos = make_float3(
+                        bird.position.x - diff.x,
+                        bird.position.y - diff.y,
+                        bird.position.z - diff.z
+                    );
+                    cohesion.x += otherPos.x;
+                    cohesion.y += otherPos.y;
+                    cohesion.z += otherPos.z;
+                    cohesionCount++;
+                }
             }
+
+            __syncthreads();
         }
 
-        // Compute final forces with weights
         float3 separationForce = make_float3(0.0f, 0.0f, 0.0f);
         float3 alignmentForce = make_float3(0.0f, 0.0f, 0.0f);
         float3 cohesionForce = make_float3(0.0f, 0.0f, 0.0f);
 
-        // Finalize separation force
         if (separationCount > 0) {
             separation.x /= separationCount;
             separation.y /= separationCount;
@@ -184,20 +187,17 @@ __global__ void calculateForces(float separationWeight, float alignmentWeight, f
             );
         }
 
-        // Finalize alignment force
         if (alignmentCount > 0) {
             alignment.x /= alignmentCount;
             alignment.y /= alignmentCount;
             alignment.z /= alignmentCount;
 
-            // Calculate steering force = desired - current
             float3 steer = make_float3(
                 alignment.x - bird.velocity.x,
                 alignment.y - bird.velocity.y,
                 alignment.z - bird.velocity.z
             );
 
-            // Limit the force
             float len = sqrtf(steer.x * steer.x + steer.y * steer.y + steer.z * steer.z);
             if (len > MAX_FORCE && len > EPSILON) {
                 steer.x = (steer.x / len) * MAX_FORCE;
@@ -208,20 +208,17 @@ __global__ void calculateForces(float separationWeight, float alignmentWeight, f
             alignmentForce = steer;
         }
 
-        // Finalize cohesion force
         if (cohesionCount > 0) {
             cohesion.x /= cohesionCount;
             cohesion.y /= cohesionCount;
             cohesion.z /= cohesionCount;
 
-            // Create vector pointing from current position to target
             float3 desired = make_float3(
                 cohesion.x - bird.position.x,
                 cohesion.y - bird.position.y,
                 cohesion.z - bird.position.z
             );
 
-            // Scale to max speed
             float len = sqrtf(desired.x * desired.x + desired.y * desired.y + desired.z * desired.z);
             if (len > EPSILON) {
                 desired.x = (desired.x / len) * MAX_SPEED;
@@ -229,14 +226,12 @@ __global__ void calculateForces(float separationWeight, float alignmentWeight, f
                 desired.z = (desired.z / len) * MAX_SPEED;
             }
 
-            // Steering = Desired - Current
             float3 steer = make_float3(
                 desired.x - bird.velocity.x,
                 desired.y - bird.velocity.y,
                 desired.z - bird.velocity.z
             );
 
-            // Limit the force
             len = sqrtf(steer.x * steer.x + steer.y * steer.y + steer.z * steer.z);
             if (len > MAX_FORCE && len > EPSILON) {
                 steer.x = (steer.x / len) * MAX_FORCE;
@@ -247,7 +242,6 @@ __global__ void calculateForces(float separationWeight, float alignmentWeight, f
             cohesionForce = steer;
         }
 
-        // Apply weights to forces
         separationForce.x *= separationWeight;
         separationForce.y *= separationWeight;
         separationForce.z *= separationWeight;
@@ -260,7 +254,6 @@ __global__ void calculateForces(float separationWeight, float alignmentWeight, f
         cohesionForce.y *= cohesionWeight;
         cohesionForce.z *= cohesionWeight;
 
-        // Determine dominant force for coloring
         float sepMag = sqrtf(separationForce.x * separationForce.x +
             separationForce.y * separationForce.y +
             separationForce.z * separationForce.z);
@@ -271,44 +264,38 @@ __global__ void calculateForces(float separationWeight, float alignmentWeight, f
             cohesionForce.y * cohesionForce.y +
             cohesionForce.z * cohesionForce.z);
 
-        // Add this check for zero weights
         if (separationWeight < EPSILON) sepMag = 0.0f;
         if (alignmentWeight < EPSILON) aliMag = 0.0f;
         if (cohesionWeight < EPSILON) cohMag = 0.0f;
 
         if (sepMag > aliMag && sepMag > cohMag) {
-            bird.dominantForce = 0;  // Separation dominant (red)
+            bird.dominantForce = 0;  // Separation (red)
         }
         else if (aliMag > sepMag && aliMag > cohMag) {
-            bird.dominantForce = 1;  // Alignment dominant (green)
+            bird.dominantForce = 1;  // Alignment (blue)
         }
         else if (cohMag > 0.0f) {
-            bird.dominantForce = 2;  // Cohesion dominant (blue)
+            bird.dominantForce = 2;  // Cohesion (green)
         }
         else {
-            // If all forces are very small or weights are 0, default to separation
             bird.dominantForce = 0;
         }
 
-        // Sum all forces
         bird.acceleration.x = separationForce.x + alignmentForce.x + cohesionForce.x;
         bird.acceleration.y = separationForce.y + alignmentForce.y + cohesionForce.y;
         bird.acceleration.z = separationForce.z + alignmentForce.z + cohesionForce.z;
     }
 }
 
-// Update bird positions based on velocity and acceleration
 __global__ void updatePositions(float dt) {
     int tid = threadIdx.x + blockIdx.x * blockDim.x;
     if (tid < numBirds) {
         Bird& bird = birds[tid];
 
-        // Update velocity by acceleration
         bird.velocity.x += bird.acceleration.x * dt;
         bird.velocity.y += bird.acceleration.y * dt;
         bird.velocity.z += bird.acceleration.z * dt;
 
-        // Limit speed to maximum
         float speed = sqrtf(bird.velocity.x * bird.velocity.x +
             bird.velocity.y * bird.velocity.y +
             bird.velocity.z * bird.velocity.z);
@@ -318,15 +305,12 @@ __global__ void updatePositions(float dt) {
             bird.velocity.z = (bird.velocity.z / speed) * MAX_SPEED;
         }
 
-        // Update position by velocity
         bird.position.x += bird.velocity.x * dt;
         bird.position.y += bird.velocity.y * dt;
         bird.position.z += bird.velocity.z * dt;
 
-        // Reset acceleration
         bird.acceleration = make_float3(0.0f, 0.0f, 0.0f);
 
-        // Handle boundary conditions (wraparound)
         if (bird.position.x < minBounds.x) bird.position.x = maxBounds.x;
         if (bird.position.y < minBounds.y) bird.position.y = maxBounds.y;
         if (bird.position.z < minBounds.z) bird.position.z = maxBounds.z;
@@ -336,32 +320,26 @@ __global__ void updatePositions(float dt) {
     }
 }
 
-// Ray struct for rendering
 struct Ray {
     float3 origin;
     float3 direction;
 };
 
-// Function to render birds using simple ray casting
 __global__ void renderBirdsKernel(uchar4* output, int width, int height) {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
 
     if (x >= width || y >= height) return;
 
-    // Calculate normalized device coordinates
     float u = (float)x / width * 2.0f - 1.0f;
     float v = (float)(height - y) / height * 2.0f - 1.0f;
 
-    // Maintain aspect ratio
     u *= (float)width / height;
 
-    // Camera setup
     float3 cameraPos = make_float3(0.0f, 0.0f, 120.0f);
     float3 lookAt = make_float3(0.0f, 0.0f, 0.0f);
     float3 up = make_float3(0.0f, 1.0f, 0.0f);
 
-    // Create normalized camera direction vectors
     float3 forward = make_float3(
         lookAt.x - cameraPos.x,
         lookAt.y - cameraPos.y,
@@ -388,7 +366,6 @@ __global__ void renderBirdsKernel(uchar4* output, int width, int height) {
         forward.x * right.y - forward.y * right.x
     );
 
-    // Create ray direction
     float3 rayDirection = make_float3(
         forward.x + u * right.x + v * camUp.x,
         forward.y + u * right.y + v * camUp.y,
@@ -403,16 +380,13 @@ __global__ void renderBirdsKernel(uchar4* output, int width, int height) {
     ray.origin = cameraPos;
     ray.direction = rayDirection;
 
-    // Background color
     uchar4 bgColor = make_uchar4(25, 25, 40, 255);
     output[y * width + x] = bgColor;
 
-    // Render each bird as a simple colored sphere
     const float birdRadius = 1.0f;
     float closestHit = 1e30f;
     int closestBird = -1;
 
-    // Process only the first MAX_BIRDS birds to prevent potential issues with uninitialized data
     int maxBirdsToCheck = min(numBirds, MAX_BIRDS);
 
     for (int i = 0; i < maxBirdsToCheck; i++) {
@@ -442,7 +416,6 @@ __global__ void renderBirdsKernel(uchar4* output, int width, int height) {
         }
     }
 
-    // If we hit a bird, color it based on its dominant force
     if (closestBird >= 0 && closestBird < maxBirdsToCheck) {
         uchar4 color;
 
@@ -460,7 +433,6 @@ __global__ void renderBirdsKernel(uchar4* output, int width, int height) {
             color = make_uchar4(200, 200, 200, 255);
         }
 
-        // Simple lighting
         float3 hitPoint = make_float3(
             ray.origin.x + closestHit * ray.direction.x,
             ray.origin.y + closestHit * ray.direction.y,
@@ -487,7 +459,7 @@ __global__ void renderBirdsKernel(uchar4* output, int width, int height) {
         lightDir.z /= len;
 
         float diffuse = normal.x * lightDir.x + normal.y * lightDir.y + normal.z * lightDir.z;
-        diffuse = max(0.2f, diffuse); // Ambient + diffuse
+        diffuse = max(0.2f, diffuse);
 
         color.x = min(255, (int)(color.x * diffuse));
         color.y = min(255, (int)(color.y * diffuse));
@@ -497,7 +469,6 @@ __global__ void renderBirdsKernel(uchar4* output, int width, int height) {
     }
 }
 
-// Initialize performance metrics
 __global__ void initMetrics() {
     metrics.forceCalculationTime = 0.0f;
     metrics.positionUpdateTime = 0.0f;
@@ -505,7 +476,6 @@ __global__ void initMetrics() {
     metrics.totalTime = 0.0f;
 }
 
-// Reset performance metrics
 __global__ void resetMetrics() {
     metrics.forceCalculationTime = 0.0f;
     metrics.positionUpdateTime = 0.0f;
@@ -513,7 +483,6 @@ __global__ void resetMetrics() {
     metrics.totalTime = 0.0f;
 }
 
-// Free simulation resources - internal implementation
 void freeCudaResources() {
     if (d_states) {
         cudaFree(d_states);
@@ -528,10 +497,7 @@ void freeCudaResources() {
     cudaEventDestroy(posStopEvent);
 }
 
-// Initialize the simulation
 extern "C" void initSimulation(int birdCount, float* minBoundsArray, float* maxBoundsArray) {
-    // Set up simulation parameters
-    // Ensure birdCount doesn't exceed MAX_BIRDS
     if (birdCount > MAX_BIRDS) {
         printf("Warning: Requested bird count %d exceeds maximum of %d. Using %d birds.\n",
             birdCount, MAX_BIRDS, MAX_BIRDS);
@@ -546,7 +512,6 @@ extern "C" void initSimulation(int birdCount, float* minBoundsArray, float* maxB
     cudaMemcpyToSymbol(minBounds, &mins, sizeof(float3));
     cudaMemcpyToSymbol(maxBounds, &maxs, sizeof(float3));
 
-    // Create CUDA events for timing
     cudaEventCreate(&startEvent);
     cudaEventCreate(&stopEvent);
     cudaEventCreate(&forceStartEvent);
@@ -554,18 +519,14 @@ extern "C" void initSimulation(int birdCount, float* minBoundsArray, float* maxB
     cudaEventCreate(&posStartEvent);
     cudaEventCreate(&posStopEvent);
 
-    // Initialize RNG
     cudaMalloc(&d_states, birdCount * sizeof(curandState));
 
-    // Calculate kernel launch parameters
     dim3 blockSize(256);
     dim3 gridSize((birdCount + blockSize.x - 1) / blockSize.x);
 
-    // Initialize performance metrics
     initMetrics << <1, 1 >> > ();
     cudaDeviceSynchronize();
 
-    // Initialize random states and birds
     setupRNG << <gridSize, blockSize >> > (d_states);
     cudaDeviceSynchronize();
 
@@ -575,7 +536,6 @@ extern "C" void initSimulation(int birdCount, float* minBoundsArray, float* maxB
     printf("Simulation initialized with %d birds\n", birdCount);
 }
 
-// Update the simulation for one time step
 extern "C" void updateSimulation(float dt, float separationWeight, float alignmentWeight, float cohesionWeight) {
     int birdCount;
     cudaMemcpyFromSymbol(&birdCount, numBirds, sizeof(int));
@@ -585,26 +545,21 @@ extern "C" void updateSimulation(float dt, float separationWeight, float alignme
 
     float elapsedTime;
 
-    // Start total timing
     cudaEventRecord(startEvent);
 
-    // Calculate forces
     cudaEventRecord(forceStartEvent);
-    calculateForces << <gridSize, blockSize >> > (separationWeight, alignmentWeight, cohesionWeight);
+    calculateForces << <gridSize, blockSize, blockSize.x * sizeof(Bird) >> > (separationWeight, alignmentWeight, cohesionWeight);
     cudaEventRecord(forceStopEvent);
     cudaDeviceSynchronize();
 
-    // Update positions
     cudaEventRecord(posStartEvent);
     updatePositions << <gridSize, blockSize >> > (dt);
     cudaEventRecord(posStopEvent);
     cudaDeviceSynchronize();
 
-    // End total timing
     cudaEventRecord(stopEvent);
     cudaEventSynchronize(stopEvent);
 
-    // Calculate elapsed times
     cudaEventElapsedTime(&elapsedTime, forceStartEvent, forceStopEvent);
     PerformanceMetrics h_metrics;
     cudaMemcpyFromSymbol(&h_metrics, metrics, sizeof(PerformanceMetrics));
@@ -621,9 +576,7 @@ extern "C" void updateSimulation(float dt, float separationWeight, float alignme
     cudaMemcpyToSymbol(metrics, &h_metrics, sizeof(PerformanceMetrics));
 }
 
-// Perform benchmark run without visualization
 extern "C" void runBenchmark(int birdCount, int steps, float dt, float separationWeight, float alignmentWeight, float cohesionWeight) {
-    // Reset performance metrics
     resetMetrics << <1, 1 >> > ();
     cudaDeviceSynchronize();
 
@@ -637,11 +590,9 @@ extern "C" void runBenchmark(int birdCount, int steps, float dt, float separatio
         }
     }
 
-    // Get final metrics
     PerformanceMetrics h_metrics;
     cudaMemcpyFromSymbol(&h_metrics, metrics, sizeof(PerformanceMetrics));
 
-    // Report performance
     printf("\n=== Performance Report ===\n");
     printf("Total steps: %d\n", h_metrics.stepsCompleted);
     printf("Total time: %.3f seconds\n", h_metrics.totalTime);
@@ -664,7 +615,6 @@ extern "C" void runBenchmark(int birdCount, int steps, float dt, float separatio
     printf("=========================\n");
 }
 
-// Perform scaling test with different flock sizes
 extern "C" void runScalingTest(int* flockSizes, int numSizes, int steps, float dt, float separationWeight, float alignmentWeight, float cohesionWeight) {
     printf("Running scaling test with various flock sizes...\n");
 
@@ -672,22 +622,17 @@ extern "C" void runScalingTest(int* flockSizes, int numSizes, int steps, float d
         int birdCount = flockSizes[s];
         printf("\n=== Testing with %d birds ===\n", birdCount);
 
-        // Reinitialize simulation with new bird count
         float minBoundsArray[3] = { -50.0f, -50.0f, -50.0f };
         float maxBoundsArray[3] = { 50.0f, 50.0f, 50.0f };
 
-        // Free previous resources
         freeCudaResources();
 
-        // Initialize with new count
         initSimulation(birdCount, minBoundsArray, maxBoundsArray);
 
-        // Run benchmark
         runBenchmark(birdCount, steps, dt, separationWeight, alignmentWeight, cohesionWeight);
     }
 }
 
-// Render the birds to the output buffer
 extern "C" void renderBirds(int width, int height, uchar4* output) {
     dim3 blockSize(16, 16);
     dim3 gridSize((width + blockSize.x - 1) / blockSize.x,
@@ -697,12 +642,10 @@ extern "C" void renderBirds(int width, int height, uchar4* output) {
     cudaDeviceSynchronize();
 }
 
-// Get performance metrics
 extern "C" void getPerformanceMetrics(PerformanceMetrics* out_metrics) {
     cudaMemcpyFromSymbol(out_metrics, metrics, sizeof(PerformanceMetrics));
 }
 
-// Free simulation resources - exported function
 extern "C" void freeSimulation() {
     freeCudaResources();
 }
