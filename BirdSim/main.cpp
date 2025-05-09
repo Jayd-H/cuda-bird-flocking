@@ -7,6 +7,8 @@
 #include <cuda_gl_interop.h>
 #include <helper_functions.h>
 #include <helper_cuda.h>
+#include <algorithm>
+#include <float.h>
 
 typedef unsigned int uint;
 typedef unsigned char uchar;
@@ -16,17 +18,22 @@ typedef unsigned char uchar;
 #define DEFAULT_BIRD_COUNT 200
 #define DEFAULT_BENCHMARK_STEPS 1000
 #define DEFAULT_SCALING_STEPS 500
+#define REPORT_INTERVAL_SECS 5
+#define MAX_FPS_HISTORY 100
 
 // Predefined flock sizes for scaling test
-const int FLOCK_SIZES[] = { 200, 1000, 5000, 10000 };
+const int FLOCK_SIZES[] = { 100, 500, 1000, 5000 };
 const int NUM_FLOCK_SIZES = sizeof(FLOCK_SIZES) / sizeof(FLOCK_SIZES[0]);
 
-// Performance metrics structure
 struct PerformanceMetrics {
     float forceCalculationTime;
     float positionUpdateTime;
+    float renderTime;
     int stepsCompleted;
     float totalTime;
+    float minFps;
+    float maxFps;
+    float avgFps;
 };
 
 StopWatchInterface* timer = 0;
@@ -38,6 +45,16 @@ dim3 gridSize((MAX_BIRDS + blockSize.x - 1) / blockSize.x);
 GLuint pbo = 0;
 struct cudaGraphicsResource* cuda_pbo_resource;
 GLuint displayTex = 0;
+
+// Performance tracking variables
+float fpsHistory[MAX_FPS_HISTORY];
+int fpsHistoryIndex = 0;
+int fpsHistoryCount = 0;
+float totalFrameTime = 0.0f;
+float simulationTime = 0.0f;
+float renderTime = 0.0f;
+int fpsCounter = 0;
+float lastReportTime = 0.0f;
 
 // Simulation parameters
 int numBirds = DEFAULT_BIRD_COUNT;
@@ -59,6 +76,7 @@ void runBenchmarkMode(int birdCount, int steps);
 void runScalingMode();
 void printUsage();
 void processExitKey(unsigned char key, int x, int y);
+void printPerformanceReport();
 
 // Function declarations for CUDA operations
 extern "C" void initSimulation(int numBirds, float* minBounds, float* maxBounds);
@@ -87,29 +105,89 @@ void initGL(int* argc, char** argv) {
     }
 }
 
+void printPerformanceReport() {
+    if (fpsHistoryCount > 0) {
+        float totalFps = 0.0f;
+        float minFps = FLT_MAX;
+        float maxFps = 0.0f;
+
+        for (int i = 0; i < fpsHistoryCount; i++) {
+            totalFps += fpsHistory[i];
+            minFps = std::min(minFps, fpsHistory[i]);
+            maxFps = std::max(maxFps, fpsHistory[i]);
+        }
+
+        float avgFps = totalFps / fpsHistoryCount;
+
+        PerformanceMetrics cudaMetrics;
+        getPerformanceMetrics(&cudaMetrics);
+
+        printf("\n=== Final Performance Report ===\n");
+        printf("Bird count: %d\n", numBirds);
+        printf("Average FPS: %.1f\n", avgFps);
+        printf("Min FPS: %.1f\n", minFps);
+        printf("Max FPS: %.1f\n", maxFps);
+        printf("Time breakdown per frame:\n");
+        printf("  - Simulation: %.2fms (%.1f%%)\n",
+            simulationTime * 1000.0f / fpsCounter,
+            simulationTime * 100.0f / totalFrameTime);
+        printf("  - Rendering: %.2fms (%.1f%%)\n",
+            renderTime * 1000.0f / fpsCounter,
+            renderTime * 100.0f / totalFrameTime);
+        printf("Component breakdown in simulation:\n");
+        printf("=== Performance Report ===\n");
+        printf("Total steps: %d\n", cudaMetrics.stepsCompleted);
+        printf("Total time: %.3f seconds\n", cudaMetrics.totalTime);
+        printf("Steps per second: %.1f\n", cudaMetrics.stepsCompleted / cudaMetrics.totalTime);
+        printf("Time breakdown:\n");
+        printf("  - Force calculations: %.3fs (%.1f%%)\n",
+            cudaMetrics.forceCalculationTime,
+            (cudaMetrics.forceCalculationTime * 100.0f) / cudaMetrics.totalTime);
+        printf("  - Position updates: %.3fs (%.1f%%)\n",
+            cudaMetrics.positionUpdateTime,
+            (cudaMetrics.positionUpdateTime * 100.0f) / cudaMetrics.totalTime);
+        float overhead = cudaMetrics.totalTime -
+            (cudaMetrics.forceCalculationTime + cudaMetrics.positionUpdateTime);
+        printf("  - Other/overhead: %.3fs (%.1f%%)\n",
+            overhead,
+            (overhead * 100.0f) / cudaMetrics.totalTime);
+        printf("=========================\n");
+    }
+}
+
 // Display results using OpenGL
 void display() {
-    static float lastTime = 0.0f;
-    static int frameCount = 0;
-    static float fps = 0.0f;
+    static float lastFrameTime = 0.0f;
+    static StopWatchInterface* frameTimer = NULL;
+    static StopWatchInterface* simTimer = NULL;
+    static StopWatchInterface* renderTimer = NULL;
 
-    frameCount++;
-    float currentTime = sdkGetTimerValue(&timer) / 1000.0f;
-    if (currentTime - lastTime > 1.0f) {
-        fps = frameCount / (currentTime - lastTime);
-        frameCount = 0;
-        lastTime = currentTime;
-        char title[256];
-        sprintf(title, "Bird Flocking Simulation - CUDA - %d birds - FPS: %.1f", numBirds, fps);
-        glutSetWindowTitle(title);
+    if (frameTimer == NULL) {
+        sdkCreateTimer(&frameTimer);
+        sdkCreateTimer(&simTimer);
+        sdkCreateTimer(&renderTimer);
+        sdkStartTimer(&frameTimer);
+        lastReportTime = sdkGetTimerValue(&frameTimer) / 1000.0f;
     }
 
-    sdkStartTimer(&timer);
+    // Calculate elapsed time
+    float currentTime = sdkGetTimerValue(&frameTimer) / 1000.0f;
+    float dt = currentTime - lastFrameTime;
+    lastFrameTime = currentTime;
+    totalFrameTime += dt;
+
+    fpsCounter++;
 
     // Update bird positions and velocities
+    sdkStartTimer(&simTimer);
     updateSimulation(0.016f, separationWeight, alignmentWeight, cohesionWeight);
+    sdkStopTimer(&simTimer);
+    float simTime = sdkGetTimerValue(&simTimer) / 1000.0f;
+    simulationTime += simTime;
+    sdkResetTimer(&simTimer);
 
     // Map PBO to get CUDA device pointer
+    sdkStartTimer(&renderTimer);
     uchar4* d_output;
     checkCudaErrors(cudaGraphicsMapResources(1, &cuda_pbo_resource, 0));
     size_t num_bytes;
@@ -147,7 +225,36 @@ void display() {
     glBindBuffer(GL_PIXEL_UNPACK_BUFFER_ARB, 0);
 
     glutSwapBuffers();
-    sdkStopTimer(&timer);
+    sdkStopTimer(&renderTimer);
+    float rendTime = sdkGetTimerValue(&renderTimer) / 1000.0f;
+    renderTime += rendTime;
+    sdkResetTimer(&renderTimer);
+
+    // Report FPS periodically
+    if (currentTime - lastReportTime >= REPORT_INTERVAL_SECS) {
+        float fps = fpsCounter / (currentTime - lastReportTime);
+
+        // Store in history
+        fpsHistory[fpsHistoryIndex] = fps;
+        fpsHistoryIndex = (fpsHistoryIndex + 1) % MAX_FPS_HISTORY;
+        if (fpsHistoryCount < MAX_FPS_HISTORY) {
+            fpsHistoryCount++;
+        }
+
+        printf("FPS: %.1f | Birds: %d | Sim time: %.2fms | Render time: %.2fms\n",
+            fps, numBirds,
+            (simulationTime / fpsCounter) * 1000.0f,
+            (renderTime / fpsCounter) * 1000.0f);
+
+        char title[256];
+        sprintf(title, "Bird Flocking Simulation - CUDA - %d birds - FPS: %.1f", numBirds, fps);
+        glutSetWindowTitle(title);
+
+        fpsCounter = 0;
+        simulationTime = 0.0f;
+        renderTime = 0.0f;
+        lastReportTime = currentTime;
+    }
 }
 
 // GLUT timer callback
@@ -160,6 +267,7 @@ void timerEvent(int value) {
 
 void processExitKey(unsigned char key, int /*x*/, int /*y*/) {
     if (key == 27) {  // ESC key
+        printPerformanceReport();
         glutDestroyWindow(glutGetWindow());
     }
 }
@@ -296,7 +404,6 @@ void runScalingMode() {
 
 // Entry point
 int main(int argc, char** argv) {
-    // Find CUDA device
     int devID = findCudaDevice(argc, (const char**)argv);
     if (devID < 0) {
         printf("No CUDA Capable devices found, exiting...\n");

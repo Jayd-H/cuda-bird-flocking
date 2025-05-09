@@ -1,3 +1,4 @@
+// BirdSim/main.cu
 #include <stdlib.h>
 #include <stdio.h>
 #include <math.h>
@@ -18,8 +19,12 @@ typedef unsigned char uchar;
 struct PerformanceMetrics {
     float forceCalculationTime;
     float positionUpdateTime;
+    float renderTime;
     int stepsCompleted;
     float totalTime;
+    float minFps;
+    float maxFps;
+    float avgFps;
 };
 
 struct Bird {
@@ -124,7 +129,6 @@ __global__ void calculateForces(float separationWeight, float alignmentWeight, f
 
                 Bird& other = sharedBirds[j];
 
-                // Early rejection check - just compare one axis first
                 float dx = abs(bird.position.x - other.position.x);
                 float size_x = maxBounds.x - minBounds.x;
                 if (dx > size_x * 0.5f) {
@@ -269,13 +273,13 @@ __global__ void calculateForces(float separationWeight, float alignmentWeight, f
         if (cohesionWeight < EPSILON) cohMag = 0.0f;
 
         if (sepMag > aliMag && sepMag > cohMag) {
-            bird.dominantForce = 0;  // Separation (red)
+            bird.dominantForce = 0;
         }
         else if (aliMag > sepMag && aliMag > cohMag) {
-            bird.dominantForce = 1;  // Alignment (blue)
+            bird.dominantForce = 1;
         }
         else if (cohMag > 0.0f) {
-            bird.dominantForce = 2;  // Cohesion (green)
+            bird.dominantForce = 2;
         }
         else {
             bird.dominantForce = 0;
@@ -420,13 +424,13 @@ __global__ void renderBirdsKernel(uchar4* output, int width, int height) {
         uchar4 color;
 
         switch (birds[closestBird].dominantForce) {
-        case 0: // Separation = Red
+        case 0:
             color = make_uchar4(230, 50, 50, 255);
             break;
-        case 1: // Alignment = Blue
+        case 1:
             color = make_uchar4(50, 50, 230, 255);
             break;
-        case 2: // Cohesion = Green
+        case 2:
             color = make_uchar4(50, 230, 50, 255);
             break;
         default:
@@ -472,15 +476,23 @@ __global__ void renderBirdsKernel(uchar4* output, int width, int height) {
 __global__ void initMetrics() {
     metrics.forceCalculationTime = 0.0f;
     metrics.positionUpdateTime = 0.0f;
+    metrics.renderTime = 0.0f;
     metrics.stepsCompleted = 0;
     metrics.totalTime = 0.0f;
+    metrics.minFps = FLT_MAX;
+    metrics.maxFps = 0.0f;
+    metrics.avgFps = 0.0f;
 }
 
 __global__ void resetMetrics() {
     metrics.forceCalculationTime = 0.0f;
     metrics.positionUpdateTime = 0.0f;
+    metrics.renderTime = 0.0f;
     metrics.stepsCompleted = 0;
     metrics.totalTime = 0.0f;
+    metrics.minFps = FLT_MAX;
+    metrics.maxFps = 0.0f;
+    metrics.avgFps = 0.0f;
 }
 
 void freeCudaResources() {
