@@ -14,8 +14,8 @@ typedef unsigned int uint;
 typedef unsigned char uchar;
 
 #define REFRESH_DELAY 10
-#define MAX_BIRDS 10000
-#define DEFAULT_BIRD_COUNT 200
+#define MAX_BIRDS 5000
+#define DEFAULT_BIRD_COUNT 1000
 #define DEFAULT_BENCHMARK_STEPS 1000
 #define DEFAULT_SCALING_STEPS 500
 #define REPORT_INTERVAL_SECS 5
